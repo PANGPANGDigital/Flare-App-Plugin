@@ -3,9 +3,11 @@
   // src/plugin.ts
   var API_CONFIG_PATH = "/api/config";
   var PROFILE_PATH = "/profile/info";
+  var FRIENDS_TIMELINE_PATH = "/feed/friends";
   var TOPICS_PATH = "/api/container/getIndex?containerid=100803_-_followsuper";
   var MAX_TOPIC_PAGES = 30;
   var MAX_FAILURE_DETAILS = 10;
+  var MAX_TIMELINE_MEDIA = 12;
   defineFlareSocialPlugin({
     login: {
       browser: {
@@ -14,7 +16,7 @@
         },
         async check(request, context) {
           const probeUrl = context.origin + API_CONFIG_PATH;
-          const cookies = request.cookies.cookies.filter((cookie) => cookie.sourceUrl === probeUrl).filter((cookie) => ["SUB", "SUBP", "_T_WM"].includes(cookie.name)).map(({ name, value }) => ({ name, value }));
+          const cookies = request.cookies.cookies.filter((cookie) => cookie.sourceUrl === probeUrl).filter((cookie) => ["SUB", "SUBP", "_T_WM", "MLOGIN", "ALF"].includes(cookie.name)).map(({ name, value }) => ({ name, value }));
           if (!cookies.some((cookie) => cookie.name === "SUB" && cookie.value)) {
             return { type: "pending" };
           }
@@ -48,30 +50,41 @@
           if (request.timelineId !== "checkin") {
             fail("Unsupported", "Unknown timeline");
           }
-          if (request.page.direction !== "refresh") {
+          if (request.page.direction !== "refresh" && request.page.direction !== "older") {
             return { items: [], endReached: true };
           }
           const credential = await readCredential();
-          const results = [];
-          let truncated = false;
-          try {
-            const topicPage = await fetchFollowedTopics(context, credential.cookies);
-            results.push(...topicPage.results);
-            truncated = topicPage.truncated;
-            for (const topic of topicPage.toCheck) {
-              results.push(await checkInTopic(topic, topicPage.xsrfToken, context, credential.cookies));
+          const items = [];
+          if (request.page.direction === "refresh") {
+            const results = [];
+            let truncated = false;
+            try {
+              const topicPage = await fetchFollowedTopics(context, credential.cookies);
+              results.push(...topicPage.results);
+              truncated = topicPage.truncated;
+              for (const topic of topicPage.toCheck) {
+                results.push(await checkInTopic(topic, topicPage.xsrfToken, context, credential.cookies));
+              }
+            } catch (error) {
+              if (isAuthenticationError(error)) throw error;
+              results.push({
+                name: "\u8D85\u8BDD\u5217\u8868",
+                status: "failed",
+                message: "\u8BFB\u53D6\u7B7E\u5230\u72B6\u6001\u5931\u8D25\uFF1B\u672A\u63D0\u4EA4\u7B7E\u5230\uFF0C\u8BF7\u7A0D\u540E\u5237\u65B0\u91CD\u8BD5\u3002"
+              });
             }
-          } catch (error) {
-            if (isAuthenticationError(error)) throw error;
-            results.push({
-              name: "\u8D85\u8BDD\u5217\u8868",
-              status: "failed",
-              message: "\u8BFB\u53D6\u7B7E\u5230\u72B6\u6001\u5931\u8D25\uFF1B\u672A\u63D0\u4EA4\u7B7E\u5230\uFF0C\u8BF7\u7A0D\u540E\u5237\u65B0\u91CD\u8BD5\u3002"
-            });
+            items.push(await makeSummaryItem(results, truncated, credential.profile, context));
           }
+          const feedPage = await fetchFriendsTimeline(
+            context,
+            credential.cookies,
+            request.page.direction === "older" ? request.page.cursor : void 0
+          );
+          items.push(...feedPage.items);
           return {
-            items: [await makeSummaryItem(results, truncated, credential.profile, context)],
-            endReached: true
+            items,
+            endReached: !feedPage.olderCursor,
+            ...feedPage.olderCursor ? { olderCursor: feedPage.olderCursor } : {}
           };
         }
       }
@@ -153,6 +166,180 @@
       if (isAuthenticationError(error)) throw error;
       return { name: topic.name, status: "failed", message: "\u7B7E\u5230\u8BF7\u6C42\u5931\u8D25\u6216\u5FAE\u535A\u62D2\u7EDD\u4E86\u8BF7\u6C42\u3002" };
     }
+  }
+  async function fetchFriendsTimeline(context, cookies, cursor) {
+    const url = context.origin + FRIENDS_TIMELINE_PATH + (cursor ? "?max_id=" + encodeURIComponent(cursor) : "");
+    const response = await requestJson(url, context, cookies);
+    if (!response) fail("InvalidResponse", "\u5FAE\u535A\u6CA1\u6709\u8FD4\u56DE\u6700\u65B0\u65F6\u95F4\u7EBF\u3002");
+    if (response.ok !== void 0 && !isOkResponse(response.ok)) {
+      fail("Remote", "\u5FAE\u535A\u6CA1\u6709\u8FD4\u56DE\u6700\u65B0\u65F6\u95F4\u7EBF\u3002");
+    }
+    const data = requiredObject(response.data);
+    if (!Array.isArray(data.statuses)) {
+      fail("InvalidResponse", "\u5FAE\u535A\u6700\u65B0\u65F6\u95F4\u7EBF\u683C\u5F0F\u65E0\u6CD5\u8BC6\u522B\u3002");
+    }
+    const items = data.statuses.map((status) => mapTimelineStatus(status, context)).filter((item) => item !== void 0);
+    const rawCursor = data.next_cursor_str ?? data.next_cursor;
+    const olderCursor = optionalScalarText(rawCursor);
+    return {
+      items,
+      ...olderCursor && olderCursor !== cursor ? { olderCursor } : {}
+    };
+  }
+  function mapTimelineStatus(value, context) {
+    if (!isRecord(value)) return void 0;
+    const post = mapTimelinePost(value, context);
+    if (!post) return void 0;
+    const retweetedStatus = isRecord(value.retweeted_status) ? mapTimelinePost(value.retweeted_status, context) : void 0;
+    return {
+      type: "post",
+      post,
+      ...retweetedStatus ? { presentation: { repost: retweetedStatus } } : {}
+    };
+  }
+  function mapTimelinePost(value, context) {
+    const id = optionalScalarText(value.idstr ?? value.id ?? value.mid);
+    if (!id) return void 0;
+    const host = accountHost(context);
+    const statusText = optionalScalarText(value.raw_text) || htmlToPlainText(optionalScalarText(value.text) || "");
+    const user = isRecord(value.user) ? mapTimelineProfile(value.user, context) : void 0;
+    const post = {
+      key: { id, host },
+      createdAt: parseWeiboDate(optionalScalarText(value.created_at)),
+      content: { format: "plain", value: statusText || "\uFF08\u5FAE\u535A\u5185\u5BB9\u4E3A\u7A7A\uFF09" },
+      detailType: "link",
+      url: context.origin + "/detail/" + encodeURIComponent(id),
+      ...user ? { author: user } : {}
+    };
+    const media = mapStatusImages(value, id);
+    if (media.length) post.media = media;
+    const repliesCount = optionalNonnegativeNumber(value.comments_count);
+    const repostsCount = optionalNonnegativeNumber(value.reposts_count);
+    const favouritesCount = optionalNonnegativeNumber(value.attitudes_count);
+    if (repliesCount !== void 0) post.repliesCount = repliesCount;
+    if (repostsCount !== void 0) post.repostsCount = repostsCount;
+    if (favouritesCount !== void 0) post.favouritesCount = favouritesCount;
+    return post;
+  }
+  function mapTimelineProfile(user, context) {
+    const id = optionalScalarText(user.idstr ?? user.id);
+    const handle = optionalScalarText(user.screen_name);
+    if (!id || !handle) return void 0;
+    const avatarUrl = safeWeiboMediaUrl(user.avatar_hd ?? user.profile_image_url);
+    return {
+      key: { id, host: accountHost(context) },
+      handle,
+      displayName: handle,
+      ...avatarUrl ? { avatarUrl } : {}
+    };
+  }
+  function mapStatusImages(status, statusId) {
+    const rawPics = status.pics;
+    const pics = Array.isArray(rawPics) ? rawPics : isRecord(rawPics) ? Object.values(rawPics) : [];
+    const media = [];
+    for (const [index, rawPic] of pics.entries()) {
+      if (!isRecord(rawPic)) continue;
+      const large = isRecord(rawPic.large) ? rawPic.large : {};
+      const rawUrl = optionalScalarText(large.url) || optionalScalarText(rawPic.url);
+      const url = safeWeiboMediaUrl(rawUrl);
+      if (!url) continue;
+      const previewUrl = safeWeiboMediaUrl(optionalScalarText(rawPic.url)) || url;
+      const geo = isRecord(large.geo) ? large.geo : isRecord(rawPic.geo) ? rawPic.geo : {};
+      const width = optionalPositiveNumber(geo.width);
+      const height = optionalPositiveNumber(geo.height);
+      const picId = optionalScalarText(rawPic.pid) || `${statusId}-image-${index}`;
+      media.push({
+        id: picId,
+        type: "image",
+        url,
+        previewUrl,
+        ...width !== void 0 ? { width } : {},
+        ...height !== void 0 ? { height } : {}
+      });
+      if (media.length >= MAX_TIMELINE_MEDIA) break;
+    }
+    if (!media.length) {
+      const fallbackUrl = safeWeiboMediaUrl(status.original_pic ?? status.bmiddle_pic ?? status.thumbnail_pic);
+      if (fallbackUrl) {
+        media.push({
+          id: `${statusId}-image-0`,
+          type: "image",
+          url: fallbackUrl,
+          previewUrl: safeWeiboMediaUrl(status.thumbnail_pic) || fallbackUrl
+        });
+      }
+    }
+    return media;
+  }
+  function safeWeiboMediaUrl(value) {
+    if (typeof value !== "string" || !value.trim()) return void 0;
+    const candidate = value.trim().startsWith("http://") ? "https://" + value.trim().slice("http://".length) : value.trim();
+    const match = /^https:\/\/([^/]+)\//i.exec(candidate);
+    if (!match) return void 0;
+    const host = match[1].toLowerCase();
+    const allowed = host === "sinaimg.cn" || host.endsWith(".sinaimg.cn") || host.endsWith(".weibocdn.com");
+    return allowed ? candidate : void 0;
+  }
+  function parseWeiboDate(value) {
+    const pattern = /^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+([+-])(\d{2})(\d{2})\s+(\d{4})$/;
+    const match = pattern.exec(value || "");
+    if (match) {
+      const months = {
+        Jan: 0,
+        Feb: 1,
+        Mar: 2,
+        Apr: 3,
+        May: 4,
+        Jun: 5,
+        Jul: 6,
+        Aug: 7,
+        Sep: 8,
+        Oct: 9,
+        Nov: 10,
+        Dec: 11
+      };
+      const month = months[match[1]];
+      if (month !== void 0) {
+        const localTime = Date.UTC(
+          Number(match[9]),
+          month,
+          Number(match[2]),
+          Number(match[3]),
+          Number(match[4]),
+          Number(match[5])
+        );
+        const offsetMinutes = (Number(match[7]) * 60 + Number(match[8])) * (match[6] === "+" ? 1 : -1);
+        return new Date(localTime - offsetMinutes * 6e4).toISOString();
+      }
+    }
+    const parsed = Date.parse(value || "");
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : (/* @__PURE__ */ new Date()).toISOString();
+  }
+  function htmlToPlainText(value) {
+    return decodeHtmlEntities(
+      value.replace(/<br\s*\/?>/gi, "\n").replace(/<\/(?:p|div|li)>/gi, "\n").replace(/<[^>]*>/g, "").replace(/[ \t]+\n/g, "\n").trim()
+    );
+  }
+  function decodeHtmlEntities(value) {
+    const named = {
+      amp: "&",
+      lt: "<",
+      gt: ">",
+      quot: '"',
+      apos: "'",
+      nbsp: " "
+    };
+    return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, code) => {
+      if (code.startsWith("#x") || code.startsWith("#X")) {
+        const point = Number.parseInt(code.slice(2), 16);
+        return Number.isInteger(point) && point >= 0 && point <= 1114111 ? String.fromCodePoint(point) : entity;
+      }
+      if (code.startsWith("#")) {
+        const point = Number.parseInt(code.slice(1), 10);
+        return Number.isInteger(point) && point >= 0 && point <= 1114111 ? String.fromCodePoint(point) : entity;
+      }
+      return named[code.toLowerCase()] ?? entity;
+    });
   }
   async function makeSummaryItem(results, truncated, profile, context) {
     const already = results.filter((item) => item.status === "already").length;
@@ -284,6 +471,19 @@
       fail("InvalidResponse", "\u5FAE\u535A\u6CA1\u6709\u8FD4\u56DE\u6709\u6548\u8D26\u53F7\u8D44\u6599\u3002");
     }
     return String(value);
+  }
+  function optionalScalarText(value) {
+    if (typeof value === "string") return value.trim() || void 0;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return void 0;
+  }
+  function optionalNonnegativeNumber(value) {
+    const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+    return Number.isFinite(number) && number >= 0 ? number : void 0;
+  }
+  function optionalPositiveNumber(value) {
+    const number = optionalNonnegativeNumber(value);
+    return number !== void 0 && number > 0 ? number : void 0;
   }
   function requiredObject(value) {
     if (!isRecord(value)) fail("InvalidResponse", "\u5FAE\u535A\u63A5\u53E3\u8FD4\u56DE\u4E86\u975E\u5BF9\u8C61\u6570\u636E\u3002");

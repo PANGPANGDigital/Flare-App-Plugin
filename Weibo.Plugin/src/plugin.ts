@@ -14,9 +14,11 @@ type TopicResult = {
 
 const API_CONFIG_PATH = "/api/config";
 const PROFILE_PATH = "/profile/info";
+const FRIENDS_TIMELINE_PATH = "/feed/friends";
 const TOPICS_PATH = "/api/container/getIndex?containerid=100803_-_followsuper";
 const MAX_TOPIC_PAGES = 30;
 const MAX_FAILURE_DETAILS = 10;
+const MAX_TIMELINE_MEDIA = 12;
 
 defineFlareSocialPlugin({
   login: {
@@ -28,7 +30,7 @@ defineFlareSocialPlugin({
         const probeUrl = context.origin + API_CONFIG_PATH;
         const cookies = request.cookies.cookies
           .filter((cookie) => cookie.sourceUrl === probeUrl)
-          .filter((cookie) => ["SUB", "SUBP", "_T_WM"].includes(cookie.name))
+          .filter((cookie) => ["SUB", "SUBP", "_T_WM", "MLOGIN", "ALF"].includes(cookie.name))
           .map(({ name, value }) => ({ name, value }));
         if (!cookies.some((cookie) => cookie.name === "SUB" && cookie.value)) {
           return { type: "pending" };
@@ -66,34 +68,48 @@ defineFlareSocialPlugin({
         if (request.timelineId !== "checkin") {
           fail("Unsupported", "Unknown timeline");
         }
-        if (request.page.direction !== "refresh") {
+        if (request.page.direction !== "refresh" && request.page.direction !== "older") {
           return { items: [], endReached: true };
         }
 
         const credential = await readCredential();
-        const results: TopicResult[] = [];
-        let truncated = false;
+        const items: TimelineItemV1[] = [];
 
-        try {
-          const topicPage = await fetchFollowedTopics(context, credential.cookies);
-          results.push(...topicPage.results);
-          truncated = topicPage.truncated;
+        if (request.page.direction === "refresh") {
+          const results: TopicResult[] = [];
+          let truncated = false;
 
-          for (const topic of topicPage.toCheck) {
-            results.push(await checkInTopic(topic, topicPage.xsrfToken, context, credential.cookies));
+          try {
+            const topicPage = await fetchFollowedTopics(context, credential.cookies);
+            results.push(...topicPage.results);
+            truncated = topicPage.truncated;
+
+            for (const topic of topicPage.toCheck) {
+              results.push(await checkInTopic(topic, topicPage.xsrfToken, context, credential.cookies));
+            }
+          } catch (error) {
+            if (isAuthenticationError(error)) throw error;
+            results.push({
+              name: "超话列表",
+              status: "failed",
+              message: "读取签到状态失败；未提交签到，请稍后刷新重试。",
+            });
           }
-        } catch (error) {
-          if (isAuthenticationError(error)) throw error;
-          results.push({
-            name: "超话列表",
-            status: "failed",
-            message: "读取签到状态失败；未提交签到，请稍后刷新重试。",
-          });
+
+          items.push(await makeSummaryItem(results, truncated, credential.profile, context));
         }
 
+        const feedPage = await fetchFriendsTimeline(
+          context,
+          credential.cookies,
+          request.page.direction === "older" ? request.page.cursor : undefined,
+        );
+        items.push(...feedPage.items);
+
         return {
-          items: [await makeSummaryItem(results, truncated, credential.profile, context)],
-          endReached: true,
+          items,
+          endReached: !feedPage.olderCursor,
+          ...(feedPage.olderCursor ? { olderCursor: feedPage.olderCursor } : {}),
         };
       },
     },
@@ -196,6 +212,203 @@ async function checkInTopic(
     if (isAuthenticationError(error)) throw error;
     return { name: topic.name, status: "failed", message: "签到请求失败或微博拒绝了请求。" };
   }
+}
+
+async function fetchFriendsTimeline(
+  context: PluginInvocationContextV1,
+  cookies: CookiePair[],
+  cursor?: string,
+): Promise<{ items: TimelineItemV1[]; olderCursor?: string }> {
+  const url = context.origin + FRIENDS_TIMELINE_PATH +
+    (cursor ? "?max_id=" + encodeURIComponent(cursor) : "");
+  const response = await requestJson(url, context, cookies);
+  if (!response) fail("InvalidResponse", "微博没有返回最新时间线。");
+  if (response.ok !== undefined && !isOkResponse(response.ok)) {
+    fail("Remote", "微博没有返回最新时间线。");
+  }
+
+  const data = requiredObject(response.data);
+  if (!Array.isArray(data.statuses)) {
+    fail("InvalidResponse", "微博最新时间线格式无法识别。");
+  }
+
+  const items = data.statuses
+    .map((status) => mapTimelineStatus(status, context))
+    .filter((item): item is TimelineItemV1 => item !== undefined);
+  const rawCursor = data.next_cursor_str ?? data.next_cursor;
+  const olderCursor = optionalScalarText(rawCursor);
+
+  return {
+    items,
+    ...(olderCursor && olderCursor !== cursor ? { olderCursor } : {}),
+  };
+}
+
+function mapTimelineStatus(value: unknown, context: PluginInvocationContextV1): TimelineItemV1 | undefined {
+  if (!isRecord(value)) return undefined;
+  const post = mapTimelinePost(value, context);
+  if (!post) return undefined;
+
+  const retweetedStatus = isRecord(value.retweeted_status)
+    ? mapTimelinePost(value.retweeted_status, context)
+    : undefined;
+  return {
+    type: "post",
+    post,
+    ...(retweetedStatus ? { presentation: { repost: retweetedStatus } } : {}),
+  };
+}
+
+function mapTimelinePost(value: Record<string, unknown>, context: PluginInvocationContextV1): PostV1 | undefined {
+  const id = optionalScalarText(value.idstr ?? value.id ?? value.mid);
+  if (!id) return undefined;
+
+  const host = accountHost(context);
+  const statusText = optionalScalarText(value.raw_text) || htmlToPlainText(optionalScalarText(value.text) || "");
+  const user = isRecord(value.user) ? mapTimelineProfile(value.user, context) : undefined;
+  const post: PostV1 = {
+    key: { id, host },
+    createdAt: parseWeiboDate(optionalScalarText(value.created_at)),
+    content: { format: "plain", value: statusText || "（微博内容为空）" },
+    detailType: "link",
+    url: context.origin + "/detail/" + encodeURIComponent(id),
+    ...(user ? { author: user } : {}),
+  };
+
+  const media = mapStatusImages(value, id);
+  if (media.length) post.media = media;
+
+  const repliesCount = optionalNonnegativeNumber(value.comments_count);
+  const repostsCount = optionalNonnegativeNumber(value.reposts_count);
+  const favouritesCount = optionalNonnegativeNumber(value.attitudes_count);
+  if (repliesCount !== undefined) post.repliesCount = repliesCount;
+  if (repostsCount !== undefined) post.repostsCount = repostsCount;
+  if (favouritesCount !== undefined) post.favouritesCount = favouritesCount;
+
+  return post;
+}
+
+function mapTimelineProfile(user: Record<string, unknown>, context: PluginInvocationContextV1): ProfileV1 | undefined {
+  const id = optionalScalarText(user.idstr ?? user.id);
+  const handle = optionalScalarText(user.screen_name);
+  if (!id || !handle) return undefined;
+
+  const avatarUrl = safeWeiboMediaUrl(user.avatar_hd ?? user.profile_image_url);
+  return {
+    key: { id, host: accountHost(context) },
+    handle,
+    displayName: handle,
+    ...(avatarUrl ? { avatarUrl } : {}),
+  };
+}
+
+function mapStatusImages(status: Record<string, unknown>, statusId: string): MediaV1[] {
+  const rawPics = status.pics;
+  const pics = Array.isArray(rawPics)
+    ? rawPics
+    : isRecord(rawPics)
+      ? Object.values(rawPics)
+      : [];
+  const media: MediaV1[] = [];
+
+  for (const [index, rawPic] of pics.entries()) {
+    if (!isRecord(rawPic)) continue;
+    const large = isRecord(rawPic.large) ? rawPic.large : {};
+    const rawUrl = optionalScalarText(large.url) || optionalScalarText(rawPic.url);
+    const url = safeWeiboMediaUrl(rawUrl);
+    if (!url) continue;
+
+    const previewUrl = safeWeiboMediaUrl(optionalScalarText(rawPic.url)) || url;
+    const geo = isRecord(large.geo) ? large.geo : (isRecord(rawPic.geo) ? rawPic.geo : {});
+    const width = optionalPositiveNumber(geo.width);
+    const height = optionalPositiveNumber(geo.height);
+    const picId = optionalScalarText(rawPic.pid) || `${statusId}-image-${index}`;
+    media.push({
+      id: picId,
+      type: "image",
+      url,
+      previewUrl,
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+    });
+    if (media.length >= MAX_TIMELINE_MEDIA) break;
+  }
+
+  if (!media.length) {
+    const fallbackUrl = safeWeiboMediaUrl(status.original_pic ?? status.bmiddle_pic ?? status.thumbnail_pic);
+    if (fallbackUrl) {
+      media.push({
+        id: `${statusId}-image-0`,
+        type: "image",
+        url: fallbackUrl,
+        previewUrl: safeWeiboMediaUrl(status.thumbnail_pic) || fallbackUrl,
+      });
+    }
+  }
+
+  return media;
+}
+
+function safeWeiboMediaUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const candidate = value.trim().startsWith("http://")
+    ? "https://" + value.trim().slice("http://".length)
+    : value.trim();
+  const match = /^https:\/\/([^/]+)\//i.exec(candidate);
+  if (!match) return undefined;
+  const host = match[1].toLowerCase();
+  const allowed = host === "sinaimg.cn" || host.endsWith(".sinaimg.cn") || host.endsWith(".weibocdn.com");
+  return allowed ? candidate : undefined;
+}
+
+function parseWeiboDate(value: string | undefined): string {
+  const pattern = /^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+([+-])(\d{2})(\d{2})\s+(\d{4})$/;
+  const match = pattern.exec(value || "");
+  if (match) {
+    const months: Record<string, number> = {
+      Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+      Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+    };
+    const month = months[match[1]];
+    if (month !== undefined) {
+      const localTime = Date.UTC(
+        Number(match[9]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]),
+      );
+      const offsetMinutes = (Number(match[7]) * 60 + Number(match[8])) * (match[6] === "+" ? 1 : -1);
+      return new Date(localTime - offsetMinutes * 60_000).toISOString();
+    }
+  }
+
+  const parsed = Date.parse(value || "");
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
+}
+
+function htmlToPlainText(value: string): string {
+  return decodeHtmlEntities(
+    value
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(?:p|div|li)>/gi, "\n")
+      .replace(/<[^>]*>/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .trim(),
+  );
+}
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  };
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, code: string) => {
+    if (code.startsWith("#x") || code.startsWith("#X")) {
+      const point = Number.parseInt(code.slice(2), 16);
+      return Number.isInteger(point) && point >= 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    }
+    if (code.startsWith("#")) {
+      const point = Number.parseInt(code.slice(1), 10);
+      return Number.isInteger(point) && point >= 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    }
+    return named[code.toLowerCase()] ?? entity;
+  });
 }
 
 async function makeSummaryItem(
@@ -357,6 +570,22 @@ function requiredScalarText(value: unknown): string {
     fail("InvalidResponse", "微博没有返回有效账号资料。");
   }
   return String(value);
+}
+
+function optionalScalarText(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function optionalNonnegativeNumber(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : (typeof value === "string" ? Number(value) : NaN);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
+}
+
+function optionalPositiveNumber(value: unknown): number | undefined {
+  const number = optionalNonnegativeNumber(value);
+  return number !== undefined && number > 0 ? number : undefined;
 }
 
 function requiredObject(value: unknown): Record<string, unknown> {

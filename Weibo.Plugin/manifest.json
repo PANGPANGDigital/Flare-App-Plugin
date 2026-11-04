@@ -3,9 +3,12 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "local.plugin.p1568372ac69c4df8a99cff8ad3f57936",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "name": "Weibo.Plugin",
-  "description": "在刷新签到记录时检查关注的微博超话，并只为尚未签到的超话提交签到。",
+  "description": "微博最新时间线；刷新时检查关注的超话并只为尚未签到的超话提交签到。",
+  "permissions": {
+    "mediaNetwork": true
+  },
   "platform": {
     "id": "Plugin1568372ac69c4df8a99cff8ad3f57936",
     "name": "Weibo.Plugin",
@@ -22,7 +25,9 @@
               "cookies": [
                 { "name": "SUB", "required": true },
                 { "name": "SUBP", "required": false },
-                { "name": "_T_WM", "required": false }
+                { "name": "_T_WM", "required": false },
+                { "name": "MLOGIN", "required": false },
+                { "name": "ALF", "required": false }
               ]
             }
           ]
@@ -44,7 +49,7 @@
     "timelines": [
       {
         "id": "checkin",
-        "title": "超话签到记录",
+        "title": "最新微博",
         "icon": "Home",
         "defaultForNewAccount": true
       }
