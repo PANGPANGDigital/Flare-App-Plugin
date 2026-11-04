@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "local.plugin.p1568372ac69c4df8a99cff8ad3f57936",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "name": "Weibo.Plugin",
   "description": "在刷新签到记录时检查关注的微博超话，并只为尚未签到的超话提交签到。",
   "platform": {

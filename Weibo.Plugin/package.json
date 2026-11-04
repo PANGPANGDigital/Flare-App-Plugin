@@ -1,10 +1,11 @@
 {
   "name": "weibo-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",
     "build": "npm run check && node build.mjs",
+    "publish:root": "npm run build && node publish-root.mjs",
     "dev": "node build.mjs --watch",
     "package": "npm run check && node build.mjs --package"
   },

@@ -21,6 +21,16 @@ npm run build
 
 在带有 Plugin development 功能的 Flare 构建中，打开 **Settings → Plugins → More → Plugin development**，选择本目录并启动。添加账号时选择 `https://m.weibo.cn` 作为 origin，再通过微博网页登录。刷新「超话签到记录」时间线可触发流程。
 
+## 从 GitHub 安装
+
+Flare 的 GitHub 安装器读取仓库根目录。回到仓库根目录维护的 `manifest.json`、`plugin.js` 和 `assets/icon.png` 是本项目的安装入口；源码仍保存在本目录。修改插件后，在本目录运行：
+
+```sh
+npm run publish:root
+```
+
+该命令会构建插件并同步运行文件到仓库根目录。提交根目录安装文件和本目录源码后，发布与 `manifest.json` 版本一致的稳定 tag，再在 Flare 插件管理中输入 `https://github.com/PANGPANGDigital/Flare-App-Plugin` 安装。当前项目版本为 `0.1.1`，tag 应为 `0.1.1` 或 `v0.1.1`。
+
 项目使用 SDK 生成的 plugin ID 和 platform ID；更新时应保持它们不变。
 
 ## 接口与限制
